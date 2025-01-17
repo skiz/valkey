@@ -41,6 +41,7 @@
 #include "hiredis.h"
 #include "net.h"
 #include "sds.h"
+#include "shm.h"
 #include "async.h"
 #include "win32.h"
 
@@ -724,6 +725,8 @@ static redisContext *redisContextInit(void) {
         return NULL;
     }
 
+    c->shm_context = NULL;
+
     return c;
 }
 
@@ -751,6 +754,7 @@ void redisFree(redisContext *c) {
         c->funcs->free_privctx(c->privctx);
 
     memset(c, 0xff, sizeof(*c));
+    sharedMemoryFree(c);
     hi_free(c);
 }
 
@@ -759,6 +763,23 @@ redisFD redisFreeKeepFd(redisContext *c) {
     c->fd = REDIS_INVALID_FD;
     redisFree(c);
     return fd;
+}
+
+redisReply *redisUseSharedMemoryWithMode(redisContext *c, mode_t mode) {
+    if (c->shm_context != NULL) {
+        __redisSetError(c,REDIS_ERR_OTHER,"Attempted to initialize shared memory "
+                                          "more than once for a context.");
+        return NULL;
+    }
+    return sharedMemoryInit(c,mode);
+}
+
+redisReply *redisUseSharedMemory(redisContext *c) {
+    return redisUseSharedMemoryWithMode(c,SHARED_MEMORY_DEFAULT_MODE);
+}
+
+int redisIsSharedMemoryInitialized(redisContext *c) {
+    return sharedMemoryIsInitialized(c);
 }
 
 int redisReconnect(redisContext *c) {
@@ -776,6 +797,11 @@ int redisReconnect(redisContext *c) {
 
     hi_sdsfree(c->obuf);
     redisReaderFree(c->reader);
+
+    /* Complete reinitializing of shared memory in a non-blocking mode 
+     * is not possible, so, to avoid a confusing API, the new connection 
+     * does not use shared memory. */
+    sharedMemoryFree(c);
 
     c->obuf = hi_sdsempty();
     c->reader = redisReaderCreate();
@@ -978,6 +1004,12 @@ int redisBufferRead(redisContext *c) {
     if (c->err)
         return REDIS_ERR;
 
+    if (sharedMemoryIsInitialized(c)) {
+        nread = sharedMemoryRead(c,buf,sizeof(buf));
+    } else {
+        nread = read(c->fd,buf,sizeof(buf));
+    }
+    
     nread = c->funcs->read(c, buf, sizeof(buf));
     if (nread < 0) {
         return REDIS_ERR;
@@ -1006,6 +1038,11 @@ int redisBufferWrite(redisContext *c, int *done) {
 
     if (hi_sdslen(c->obuf) > 0) {
         ssize_t nwritten = c->funcs->write(c);
+        if (sharedMemoryIsInitialized(c)) {
+            nwritten = sharedMemoryWrite(c,c->obuf,sdslen(c->obuf));
+        } else {
+            nwritten = write(c->fd,c->obuf,sdslen(c->obuf));
+        }
         if (nwritten < 0) {
             return REDIS_ERR;
         } else if (nwritten > 0) {
@@ -1041,10 +1078,13 @@ static int redisHandledPushReply(redisContext *c, void *reply) {
 /* Get a reply from our reader or set an error in the context. */
 int redisGetReplyFromReader(redisContext *c, void **reply) {
     if (redisReaderGetReply(c->reader, reply) == REDIS_ERR) {
+        sharedMemoryInitAfterReply(c, *reply);
         __redisSetError(c,c->reader->err,c->reader->errstr);
         return REDIS_ERR;
     }
-
+    if (reply != NULL) {
+        sharedMemoryInitAfterReply(c, *reply);
+    }
     return REDIS_OK;
 }
 

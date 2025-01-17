@@ -3,7 +3,7 @@
 # Copyright (C) 2010-2011 Pieter Noordhuis <pcnoordhuis at gmail dot com>
 # This file is released under the BSD license, see the COPYING file
 
-OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o
+OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o shm.o charfifo.o
 EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll
 TESTS=hiredis-test
 LIBNAME=libhiredis
@@ -42,7 +42,7 @@ OPTIMIZATION?=-O3
 WARNINGS=-Wall -Wextra -Werror -Wstrict-prototypes -Wwrite-strings -Wno-missing-field-initializers
 DEBUG_FLAGS?= -g -ggdb
 REAL_CFLAGS=$(OPTIMIZATION) -fPIC $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEBUG_FLAGS) $(PLATFORM_FLAGS)
-REAL_LDFLAGS=$(LDFLAGS)
+REAL_LDFLAGS=$(LDFLAGS) -lrt
 
 DYLIBSUFFIX=so
 STLIBSUFFIX=a
@@ -153,11 +153,13 @@ pkgconfig: $(PKGCONFNAME) $(SSL_PKGCONF)
 # Deps (use make dep to generate this)
 alloc.o: alloc.c fmacros.h alloc.h
 async.o: async.c fmacros.h alloc.h async.h hiredis.h read.h sds.h net.h dict.c dict.h win32.h async_private.h
+charfifo.o: lockless-char-fifo/charfifo.c lockless-char-fifo/charfifo.h
 dict.o: dict.c fmacros.h alloc.h dict.h
 hiredis.o: hiredis.c fmacros.h hiredis.h read.h sds.h alloc.h net.h async.h win32.h
 net.o: net.c fmacros.h net.h hiredis.h read.h sds.h alloc.h sockcompat.h win32.h
 read.o: read.c fmacros.h alloc.h read.h sds.h win32.h
 sds.o: sds.c sds.h sdsalloc.h alloc.h
+shm.o: smh.c smh.h
 sockcompat.o: sockcompat.c sockcompat.h
 test.o: test.c fmacros.h hiredis.h read.h sds.h alloc.h net.h sockcompat.h win32.h
 
@@ -268,6 +270,12 @@ check: hiredis-test
 
 .c.o:
 	$(CC) -std=c99 -c $(REAL_CFLAGS) $<
+
+shm.o:
+$(CC) -std=c99 -pedantic -c $(REAL_CFLAGS) -D_XOPEN_SOURCE=500 $<
+
+charfifo.o:
+	$(CC) -std=c99 -pedantic -c $(REAL_CFLAGS) $<
 
 clean:
 	rm -rf $(DYLIBNAME) $(STLIBNAME) $(SSL_DYLIBNAME) $(SSL_STLIBNAME) $(TESTS) $(PKGCONFNAME) examples/hiredis-example* *.o *.gcda *.gcno *.gcov
