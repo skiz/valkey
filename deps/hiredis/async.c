@@ -241,8 +241,8 @@ int redisAsyncUseSharedMemoryWithMode(redisAsyncContext *ac, redisCallbackFn *fn
     /* redisUseSharedMemory adds the SHM.OPEN command in queue already,
      * but the same is done by redisvAsyncCommand. Getting rid of the
      * duplicate is fine because no other commands must be in queue. */
-    sdsfree(c->obuf);
-    c->obuf = sdsempty();
+    hi_sdsfree(c->obuf);
+    c->obuf = hi_sdsempty();
 
     len = sharedMemoryFormatShmOpen(c,&cmd);
     return redisAsyncFormattedCommand(ac,fn,privdata,cmd,len);

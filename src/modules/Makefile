@@ -20,7 +20,7 @@ endif
 
 .SUFFIXES: .c .so .xo .o
 
-all: helloworld.so hellotype.so helloblock.so hellocluster.so hellotimer.so hellodict.so hellohook.so helloacl.so
+all: helloworld.so hellotype.so helloblock.so hellocluster.so hellotimer.so hellodict.so hellohook.so helloacl.so shm.so
 
 .c.xo:
 	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
@@ -65,5 +65,8 @@ helloacl.xo: ../valkeymodule.h
 helloacl.so: helloacl.xo
 	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
 
+shm.so:
+	cd shm && make
+
 clean:
-	rm -rf *.xo *.so
+	rm -rf *.xo *.so ./shm/*.so
