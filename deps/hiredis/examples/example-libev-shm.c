@@ -32,7 +32,7 @@ void disconnectCallback(const redisAsyncContext *c, int status) {
     printf("Disconnected...\n");
 }
 
-void OnSharedMemoryReply(redisAsyncContext *ac, void *r, void *privdata) {
+void OnSharedMemoryReply(redisAsyncContext *ac __attribute__((unused)) , void *r, void *privdata __attribute__((unused))) {
     redisReply *reply = r;
     if (reply != NULL && reply->type == REDIS_REPLY_INTEGER && reply->integer == 1) {
         printf("Using shared memory from now on!\n");

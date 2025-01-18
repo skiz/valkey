@@ -1,94 +1,82 @@
-/*
- * module-shm-preload.c
- *
- *  Created on: Nov 9, 2016
- *      Author: Edgars
- */
-
-
-/* Rewriting a few system functions to avoid duplicating a fluid Redis code.
- * I know this isn't pretty, but it's the next cleanest thing besides forking Redis.
- * Asking users to compile a custom Redis is not nice. The whole point of modules
- * is to avoid such weirdities.
- */
-
-#include "config.h"
-
 #include <dlfcn.h>
-#include <stddef.h>
+#include <unistd.h>
+#include <sys/epoll.h>
+#include <sys/select.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <stdio.h>
 
-#include "ae.h"
+// #define X(...)
+#define X printf
 
-// #ifdef HAVE_EVPORT
-// #include <port.h>
-// #endif
+// Function pointers for the real system calls
+int (*real_epoll_wait)(int epfd, struct epoll_event *events, int maxevents, int timeout) = NULL;
+ssize_t (*real_read)(int, void *, size_t) = NULL;
+ssize_t (*real_write)(int, const void *, size_t) = NULL;
 
-// #ifdef HAVE_EPOLL
-// #include <sys/epoll.h>
-// #endif
+// Function pointers for shared memory interface
+void (*ModuleSHM_BeforeSelect)() = NULL;
+void (*ModuleSHM_AfterSelect)() = NULL;
+ssize_t (*ModuleSHM_ReadUnusual)(int fd, void *buf, size_t count) = NULL;
+ssize_t (*ModuleSHM_WriteUnusual)(int fd, const void *buf, size_t count) = NULL;
 
-// #ifdef HAVE_KQUEUE
-// #include <sys/event.h>
-// #endif
+// Load shared memory functions dynamically
+void load_shm_functions() {
+    void *handle = dlopen("module-shm.so", RTLD_LAZY);
+    if (!handle) {
+        fprintf(stderr, "Failed to load module-shm.so: %s\n", dlerror());
+        return;
+    }
 
-// #include <sys/select.h>
-
-
-void (*ModuleSHM_BeforeSelect)();
-void (*ModuleSHM_AfterSelect)();
-ssize_t (*ModuleSHM_ReadUnusual)(int fd, void *buf, size_t count);
-ssize_t (*ModuleSHM_WriteUnusual)(int fd, const void *buf, size_t count);
-
-
-int aePoll(aeEventLoop *eventLoop, struct timeval *tvp) {
-    AE_LOCK(eventLoop);
-    ModuleSHM_BeforeSelect();
-    int ret = aeApiPoll(eventLoop, tvp);
-    ModuleSHM_AfterSelect();
-    AE_UNLOCK(eventLoop);
-    return ret;
+    ModuleSHM_BeforeSelect = dlsym(handle, "ModuleSHM_BeforeSelect_Impl");
+    ModuleSHM_AfterSelect = dlsym(handle, "ModuleSHM_AfterSelect_Impl");
+    ModuleSHM_ReadUnusual = dlsym(handle, "ModuleSHM_ReadUnusual_Impl");
+    ModuleSHM_WriteUnusual = dlsym(handle, "ModuleSHM_WriteUnusual_Impl");
 }
 
-// int select(int nfds, fd_set *readfds, fd_set *writefds,
-//            fd_set *exceptfds, struct timeval *timeout)
-// {
-//     static int (*real_select)(int nfds, fd_set *readfds, fd_set *writefds,
-//                               fd_set *exceptfds, struct timeval *timeout) = NULL;
-//     if (real_select == NULL) {
-//         real_select = dlsym(RTLD_NEXT, "select");
-//     }
-    
-//     ModuleSHM_BeforeSelect();
-//     int res = real_select(nfds, readfds, writefds, exceptfds, timeout);
-//     ModuleSHM_AfterSelect();
-    
-//     return res;
-// }
+// Constructor to initialize function loading
+__attribute__((constructor))
+void init() {
+    real_epoll_wait = dlsym(RTLD_NEXT, "epoll_wait");
+    real_read = dlsym(RTLD_NEXT, "read");
+    real_write = dlsym(RTLD_NEXT, "write");
 
-// ssize_t read(int fd, void *buf, size_t count)
-// {
-//     static int (*real_read)(int fd, void *buf, size_t count) = NULL;
-//     if (real_read == NULL) {
-//         real_read = dlsym(RTLD_NEXT, "read");
-//     }
-    
-//     if (fd == -1) {
-//         return ModuleSHM_ReadUnusual(fd, buf, count);
-//     } else {
-//         return real_read(fd, buf, count);
-//     }
-// }
+    load_shm_functions();
+}
 
-// ssize_t write(int fd, const void *buf, size_t count)
-// {
-//     static int (*real_write)(int fd, const void *buf, size_t count) = NULL;
-//     if (real_write == NULL) {
-//         real_write = dlsym(RTLD_NEXT, "write");
-//     }
+// Intercepted epoll_wait function
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
+     if (!real_epoll_wait) real_epoll_wait = dlsym(RTLD_NEXT, "epoll_wait");
+
+    if (ModuleSHM_BeforeSelect) ModuleSHM_BeforeSelect();
     
-//     if (fd == -1) {
-//         return ModuleSHM_WriteUnusual(fd, buf, count);
-//     } else {
-//         return real_write(fd, buf, count);
-//     }
-// }
+    int res = real_epoll_wait(epfd, events, maxevents, timeout);
+    
+    if (ModuleSHM_AfterSelect) ModuleSHM_AfterSelect();
+
+    return res;
+}
+
+// Intercepted read function
+ssize_t read(int fd, void *buf, size_t count) {
+    if (!real_read) real_read = dlsym(RTLD_NEXT, "read");
+
+    if (fd == -1 && ModuleSHM_ReadUnusual) {
+        X("Intercepted read(fd=%d, count=%zu)\n", fd, count);
+        return ModuleSHM_ReadUnusual(fd, buf, count);
+    }
+
+    return real_read(fd, buf, count);
+}
+
+// Intercepted write function
+ssize_t write(int fd, const void *buf, size_t count) {
+    if (!real_write) real_write = dlsym(RTLD_NEXT, "write");
+
+    if (fd == -1 && ModuleSHM_WriteUnusual) {
+        X("Intercepted write(fd=%d, count=%zu)\n", fd, count);
+        return ModuleSHM_WriteUnusual(fd, buf, count);
+    }
+
+    return real_write(fd, buf, count);
+}

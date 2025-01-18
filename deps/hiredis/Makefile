@@ -189,6 +189,9 @@ hiredis-example-libevent-ssl: examples/example-libevent-ssl.c adapters/libevent.
 hiredis-example-libev: examples/example-libev.c adapters/libev.h $(STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< -lev $(STLIBNAME) $(REAL_LDFLAGS)
 
+hiredis-example-libev-shm: examples/example-libev-shm.c adapters/libev.h $(STLIBNAME)
+	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< -lev $(STLIBNAME) $(REAL_LDFLAGS)
+
 hiredis-example-libhv: examples/example-libhv.c adapters/libhv.h $(STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< -lhv $(STLIBNAME) $(REAL_LDFLAGS)
 

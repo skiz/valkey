@@ -8,7 +8,6 @@
  *      Author: Josh Martin
  */
 
-
 #include "valkeymodule.h"
 
 /* Valkey modules are not supposed to use server files,
@@ -27,8 +26,8 @@
 #include "lockless-char-fifo/charfifo.h"
 
 
-#define X(...)
-//#define X printf
+// #define X(...)
+#define X printf
 
 
 /* valkeyBufferRead thinks 16k is best for a temporary buffer reading replies.
@@ -54,19 +53,20 @@ static mtx_t accessing_connections;
 static thrd_t thread;
 
 /* Only let shared memory thread process requests while the main Redis thread
- * is sleeping, and only let the main Redis thread process process requests
+ * is sleeping, and only let the main Redis thread process requests
  * when the shared memory thread is waiting. */ 
 static mtx_t processing_requests;
 static shmConnCtx *conn_ctx_processing = NULL;
 
+void (*ModuleSHM_BeforeSelect)();
+void (*ModuleSHM_AfterSelect)();
+ssize_t (*ModuleSHM_ReadUnusual)(int fd, void *buf, size_t count);
+ssize_t (*ModuleSHM_WriteUnusual)(int fd, const void *buf, size_t count);
 
-// extern void (*ModuleSHM_BeforeSelect)();
 void ModuleSHM_BeforeSelect_Impl()
 {
     mtx_unlock(&processing_requests);
 }
-void  (*ModuleSHM_BeforeSelect)() = NULL;
-
 
 void ModuleSHM_AfterSelect_Impl()
 {
@@ -74,10 +74,14 @@ void ModuleSHM_AfterSelect_Impl()
      * the main thread just called a slow syscall anyway. */
     mtx_lock(&processing_requests);
 }
-void  (*ModuleSHM_AfterSelect)() = NULL;
 
 ssize_t ModuleSHM_ReadUnusual_Impl(int fd, void *buf, size_t count)
 {
+    if (conn_ctx_processing == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
     errno = 0;
     size_t btr = CharFifo_UsedSpace(&conn_ctx_processing->mem->to_server);
     if (btr == 0) {
@@ -87,11 +91,14 @@ ssize_t ModuleSHM_ReadUnusual_Impl(int fd, void *buf, size_t count)
     CharFifo_Read(&conn_ctx_processing->mem->to_server, buf, btr);
     return btr;
 }
-ssize_t (*ModuleSHM_ReadUnusual)(int fd, void *buf, size_t count) = NULL;
-
 
 ssize_t ModuleSHM_WriteUnusual_Impl(int fd, const void *buf, size_t count)
 {
+    if (conn_ctx_processing == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
     errno = 0;
     size_t free = CharFifo_FreeSpace(&conn_ctx_processing->mem->to_client);
     ssize_t nwritten;
@@ -103,7 +110,6 @@ ssize_t ModuleSHM_WriteUnusual_Impl(int fd, const void *buf, size_t count)
     CharFifo_Write(&conn_ctx_processing->mem->to_client, buf, nwritten);
     return nwritten;
 }
-ssize_t (*ModuleSHM_WriteUnusual)(int fd, const void *buf, size_t count) = NULL;
 
 /* Spinning because avoids slow context switching. */
 static inline void mtx_lock_spinning(mtx_t *m)
@@ -120,12 +126,12 @@ static inline int module_client_conn(ValkeyModuleCtx *module)
         client *client;                 /* Client calling a command. */
     } ValkeyModuleCtx;
     return (uintptr_t)((ValkeyModuleCtx*)module)->client->conn;
-    
 }
 
 static int RunThread(void* dummy __attribute__((unused)))
 {
     for (;;) {
+
         mtx_lock_spinning(&processing_requests);
         mtx_lock_spinning(&accessing_connections);
         
@@ -133,7 +139,11 @@ static int RunThread(void* dummy __attribute__((unused)))
         listNode* it = listFirst(connections);
         while (it != NULL) {
             shmConnCtx *conn_ctx = listNodeValue(it);
-            
+            X("RunThread: Processing connection %p\n", conn_ctx);
+            if (conn_ctx == NULL) {
+                X("RunThread: conn_ctx is NULL!\n");
+            }
+        
             if (CharFifo_UsedSpace(&conn_ctx->mem->to_server) != 0) {
                 /* ...and process it. */
                 conn_ctx_processing = conn_ctx;
@@ -171,6 +181,7 @@ static int RunThread(void* dummy __attribute__((unused)))
         mtx_unlock(&accessing_connections);
         mtx_unlock(&processing_requests);
     }
+    X("end of RunThread loop");
     mtx_unlock(&accessing_connections);
     mtx_unlock(&processing_requests);
     
@@ -192,7 +203,7 @@ static int Command_Open(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return ValkeyModule_ReplyWithError(ctx, "Client shm connector version "
                                                "is too high, not supported.");
     }
-    
+    X("Passed the test");
     size_t len;
     const char* shm_name = ValkeyModule_StringPtrLen(argv[2], &len);
     if (len > 37) {
@@ -202,8 +213,9 @@ static int Command_Open(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     memmove(shm_name_cpy, shm_name, len);
     shm_name_cpy[len] = '\0';
     
-    int fd = shm_open(shm_name_cpy, O_RDWR, 0);
+    int fd = shm_open(shm_name_cpy, O_RDWR, 1);
     if (fd < 0) {
+        perror("shm_open failed");
         return ValkeyModule_ReplyWithError(ctx, "Can't find the shared memory "
                                                "file on this host");
     }
@@ -211,16 +223,15 @@ static int Command_Open(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
                          MAP_SHARED, fd, 0);
     close(fd);
     if (mem == MAP_FAILED) {
+        perror("mmap failed");
         return ValkeyModule_ReplyWithError(ctx, "Found the shared memory file but "
                                                "unable to mmap it");
     }
-    
     
     X("%lld creating shm connection \n", ustime());
     
     /* Create a client for replaying the input to */
     client *c = createClient(NULL);
-    // c->read_flags |= VALKEYMODULE_CLIENTINFO_FLAG....;
     
     shmConnCtx *conn_ctx = ValkeyModule_Alloc(sizeof(shmConnCtx));
     conn_ctx->fd = module_client_conn(ctx);
@@ -235,7 +246,6 @@ static int Command_Open(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         X("%lld creating thread \n", ustime());
         
         if (thrd_create(&thread, RunThread, NULL) != thrd_success) {
-            
             mtx_unlock(&accessing_connections);
             munmap((void*)mem, sizeof(sharedMemory));
             return ValkeyModule_ReplyWithError(ctx, "Can't create a thread to listen "

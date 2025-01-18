@@ -49,8 +49,8 @@ void __redisSetError(redisContext *c, int type, const char *str);
 
 #define SHARED_MEMORY_PROTO_VERSION 1
 
-#define X(...)
-/*#define X printf*/
+// #define X(...)
+#define X printf
 
 /* redisBufferRead thinks 16k is best for a temporary buffer reading replies.
  * A good guess is this will do well with shared memory buffer size too. */

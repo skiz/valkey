@@ -20,7 +20,7 @@ else
 	SHOBJ_CFLAGS ?= -dynamic -fno-common -g -ggdb
 	SHOBJ_LDFLAGS ?= -bundle -undefined dynamic_lookup
 endif
-CFLAGS = -I$(RM_INCLUDE_DIR) -I$(VALKEY_INCLUDE_DIR) -I$(DEPS_INCLUDE_DIR)/lua/src -I$(DEPS_INCLUDE_DIR) -g -fPIC -O3 -std=gnu11 -Wall -D_GNU_SOURCE
+CFLAGS = -I$(RM_INCLUDE_DIR) -I$(VALKEY_INCLUDE_DIR) -I$(DEPS_INCLUDE_DIR)/lua/src -I$(DEPS_INCLUDE_DIR) -g -fPIC -shared -ldl -O3 -std=gnu11 -Wall -D_GNU_SOURCE
 CC=gcc
 
 MODULE = module-shm
