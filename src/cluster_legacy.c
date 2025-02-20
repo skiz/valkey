@@ -195,11 +195,13 @@ dictType clusterSdsToListType = {
 typedef struct {
     enum {
         ITER_DICT,
-        ITER_LIST
+        ITER_LIST,
+        ITER_NODE,
     } type;
     union {
         dictIterator di;
         listIter li;
+        clusterNode *node;
     };
 } ClusterNodeIterator;
 
@@ -213,6 +215,11 @@ static void clusterNodeIterInitMyShard(ClusterNodeIterator *iter) {
     serverAssert(nodes != NULL);
     iter->type = ITER_LIST;
     listRewind(nodes, &iter->li);
+}
+
+static void clusterNodeIterNode(ClusterNodeIterator *iter, clusterNode *node) {
+    iter->type = ITER_NODE;
+    iter->node = node;
 }
 
 static clusterNode *clusterNodeIterNext(ClusterNodeIterator *iter) {
@@ -229,6 +236,15 @@ static clusterNode *clusterNodeIterNext(ClusterNodeIterator *iter) {
         /* Return the value associated with the node, or NULL if no more nodes */
         return ln ? listNodeValue(ln) : NULL;
     }
+
+    case ITER_NODE: {
+        if (iter->node) {
+            clusterNode *node = iter->node;
+            iter->node = NULL;
+            return node;
+        }
+        return NULL;
+    }
     }
     serverPanic("Unknown iterator type %d", iter->type);
 }
@@ -236,6 +252,8 @@ static clusterNode *clusterNodeIterNext(ClusterNodeIterator *iter) {
 static void clusterNodeIterReset(ClusterNodeIterator *iter) {
     if (iter->type == ITER_DICT) {
         dictResetIterator(&iter->di);
+    } else if (iter->type == ITER_NODE) {
+        iter->node = NULL;
     }
 }
 
@@ -988,7 +1006,7 @@ void clusterUpdateMyselfFlags(void) {
     int nofailover = server.cluster_replica_no_failover ? CLUSTER_NODE_NOFAILOVER : 0;
     myself->flags &= ~CLUSTER_NODE_NOFAILOVER;
     myself->flags |= nofailover;
-    myself->flags |= CLUSTER_NODE_LIGHT_HDR_SUPPORTED;
+    myself->flags |= CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED | CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED;
     if (myself->flags != oldflags) {
         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_UPDATE_STATE);
     }
@@ -1130,6 +1148,7 @@ void clusterInit(void) {
     server.cluster->failover_auth_time = 0;
     server.cluster->failover_auth_count = 0;
     server.cluster->failover_auth_rank = 0;
+    server.cluster->failover_auth_sent = 0;
     server.cluster->failover_failed_primary_rank = 0;
     server.cluster->failover_auth_epoch = 0;
     server.cluster->cant_failover_reason = CLUSTER_CANT_FAILOVER_NONE;
@@ -1720,14 +1739,16 @@ void freeClusterNode(clusterNode *n) {
     nodename = sdsnewlen(n->name, CLUSTER_NAMELEN);
     serverAssert(dictDelete(server.cluster->nodes, nodename) == DICT_OK);
     sdsfree(nodename);
-    sdsfree(n->hostname);
-    sdsfree(n->human_nodename);
-    sdsfree(n->announce_client_ipv4);
-    sdsfree(n->announce_client_ipv6);
 
     /* Release links and associated data structures. */
     if (n->link) freeClusterLink(n->link);
     if (n->inbound_link) freeClusterLink(n->inbound_link);
+
+    /* Free these members after links are freed, as freeClusterLink may access them. */
+    sdsfree(n->hostname);
+    sdsfree(n->human_nodename);
+    sdsfree(n->announce_client_ipv4);
+    sdsfree(n->announce_client_ipv6);
     listRelease(n->fail_reports);
     zfree(n->replicas);
     zfree(n);
@@ -2936,6 +2957,10 @@ void clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
             if (n && n != myself && !(nodeIsReplica(myself) && myself->replicaof == n)) {
                 sds id = sdsnewlen(forgotten_node_ext->name, CLUSTER_NAMELEN);
                 dictEntry *de = dictAddOrFind(server.cluster->nodes_black_list, id);
+                if (dictGetKey(de) != id) {
+                    /* The dict did not take ownership of the id string, so we need to free it. */
+                    sdsfree(id);
+                }
                 uint64_t expire = server.unixtime + ntohu64(forgotten_node_ext->ttl);
                 dictSetUnsignedIntegerVal(de, expire);
                 clusterDelNode(n);
@@ -3012,11 +3037,29 @@ static void clusterProcessPublishPacket(clusterMsgDataPublish *publish_data, uin
     }
 }
 
-static void clusterProcessLightPacket(clusterLink *link, uint16_t type) {
-    clusterMsgLight *hdr = (clusterMsgLight *)link->rcvbuf;
+static void clusterProcessModulePacket(clusterMsgModule *module_data, clusterNode *sender) {
+    if (!sender) return; /* Protect the module from unknown nodes. */
+    /* We need to route this message back to the right module subscribed
+     * for the right message type. */
+    uint64_t module_id = module_data->module_id; /* Endian-safe ID */
+    uint32_t len = ntohl(module_data->len);
+    uint8_t type = module_data->type;
+    unsigned char *payload = module_data->bulk_data;
 
+    sds sender_name = sdsnewlen(sender->name, CLUSTER_NAMELEN);
+    moduleCallClusterReceivers(sender_name, module_id, type, payload, len);
+    sdsfree(sender_name);
+}
+
+static void clusterProcessLightPacket(clusterNode *sender, clusterLink *link, uint16_t type) {
+    clusterMsgLight *hdr = (clusterMsgLight *)link->rcvbuf;
+    serverLog(LL_DEBUG, "Processing light packet of type: %s", clusterGetMessageTypeString(type));
     if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
         clusterProcessPublishPacket(&hdr->data.publish.msg, type);
+    } else if (type == CLUSTERMSG_TYPE_MODULE) {
+        clusterProcessModulePacket(&hdr->data.module.msg, sender);
+    } else {
+        serverAssert(0);
     }
 }
 
@@ -3024,6 +3067,7 @@ static inline int messageTypeSupportsLightHdr(uint16_t type) {
     switch (type) {
     case CLUSTERMSG_TYPE_PUBLISH: return 1;
     case CLUSTERMSG_TYPE_PUBLISHSHARD: return 1;
+    case CLUSTERMSG_TYPE_MODULE: return 1;
     }
     return 0;
 }
@@ -3116,8 +3160,14 @@ int clusterIsValidPacket(clusterLink *link) {
         explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
         explen += sizeof(clusterMsgDataUpdate);
     } else if (type == CLUSTERMSG_TYPE_MODULE) {
-        explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
-        explen += sizeof(clusterMsgModule) - 3 + ntohl(hdr->data.module.msg.len);
+        if (is_light) {
+            clusterMsgLight *hdr_light = (clusterMsgLight *)link->rcvbuf;
+            explen = sizeof(clusterMsgLight) - sizeof(union clusterMsgData);
+            explen += sizeof(clusterMsgModule) - 3 + ntohl(hdr_light->data.module.msg.len);
+        } else {
+            explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
+            explen += sizeof(clusterMsgModule) - 3 + ntohl(hdr->data.module.msg.len);
+        }
     } else {
         /* We don't know this type of packet, so we assume it's well formed. */
         explen = totlen;
@@ -3171,7 +3221,7 @@ int clusterProcessPacket(clusterLink *link) {
         }
         clusterNode *sender = link->node;
         sender->data_received = now;
-        clusterProcessLightPacket(link, type);
+        clusterProcessLightPacket(sender, link, type);
         return 1;
     }
 
@@ -3188,10 +3238,16 @@ int clusterProcessPacket(clusterLink *link) {
 
     /* Checks if the node supports light message hdr */
     if (sender) {
-        if (flags & CLUSTER_NODE_LIGHT_HDR_SUPPORTED) {
-            sender->flags |= CLUSTER_NODE_LIGHT_HDR_SUPPORTED;
+        if (flags & CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED) {
+            sender->flags |= CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED;
         } else {
-            sender->flags &= ~CLUSTER_NODE_LIGHT_HDR_SUPPORTED;
+            sender->flags &= ~CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED;
+        }
+
+        if (flags & CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED) {
+            sender->flags |= CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED;
+        } else {
+            sender->flags &= ~CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED;
         }
     }
 
@@ -3278,8 +3334,8 @@ int clusterProcessPacket(clusterLink *link) {
                         /* Unable to retrieve the node's IP address from the connection. Without a
                          * valid IP, the node becomes unusable in the cluster. This failure might be
                          * due to the connection being closed. */
-                        serverLog(LL_NOTICE, "Closing link even though we received a MEET packet on it, "
-                                             "because the connection has an error");
+                        serverLog(LL_NOTICE, "Closing cluster link due to failure to retrieve IP from the connection, "
+                                             "possibly caused by a closed connection.");
                         freeClusterLink(link);
                         return 0;
                     }
@@ -3302,14 +3358,14 @@ int clusterProcessPacket(clusterLink *link) {
                     clusterAddNode(node);
                     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
                 } else {
-                    /* A second MEET packet was received on an existing link during the handshake process.
-                     * This happens when the other node detects no inbound link, and re-sends a MEET packet
-                     * before this node can respond with a PING. This MEET is a no-op.
+                    /* A second MEET packet was received on an existing link during the handshake
+                     * process. This happens when the other node detects no inbound link, and
+                     * re-sends a MEET packet before this node can respond with a PING.
+                     * This MEET is a no-op.
                      *
-                     * Note: Nodes in HANDSHAKE state are not fully "known" (random names), so the sender
-                     * remains unidentified at this point. The MEET packet might be re-sent if the inbound
-                     * connection is still unestablished by the next cron cycle.
-                     */
+                     * Note: Nodes in HANDSHAKE state are not fully "known" (random names), so the
+                     * sender remains unidentified at this point. The MEET packet might be re-sent
+                     * if the inbound connection is still unestablished by the next cron cycle. */
                     debugServerAssert(link->inbound && nodeInHandshake(link->node));
                 }
 
@@ -3318,16 +3374,19 @@ int clusterProcessPacket(clusterLink *link) {
                  * of the message type. */
                 clusterProcessGossipSection(hdr, link);
             } else if (sender->link && nodeExceedsHandshakeTimeout(sender, now)) {
-                /* The MEET packet is from a known node, after the handshake timeout, so the sender thinks that I do not
-                 * know it.
-                 * Free my outbound link to that node, triggering a reconnect and a PING over the new link.
-                 * Once that node receives our PING, it should recognize the new connection as an inbound link from me.
-                 * We should only free the outbound link if the node is known for more time than the handshake timeout,
-                 * since during this time, the other side might still be trying to complete the handshake. */
+                /* The MEET packet is from a known node, after the handshake timeout, so the sender
+                 * thinks that I do not know it.
+                 * Free my outbound link to that node, triggering a reconnect and a PING over the
+                 * new link.
+                 * Once that node receives our PING, it should recognize the new connection as an
+                 * inbound link from me. We should only free the outbound link if the node is known
+                 * for more time than the handshake timeout, since during this time, the other side
+                 * might still be trying to complete the handshake. */
 
                 /* We should always receive a MEET packet on an inbound link. */
                 serverAssert(link != sender->link);
-                serverLog(LL_NOTICE, "Freeing outbound link to node %.40s (%s) after receiving a MEET packet from this known node",
+                serverLog(LL_NOTICE, "Freeing outbound link to node %.40s (%s) after receiving a MEET packet "
+                                     "from this known node",
                           sender->name, sender->human_nodename);
                 freeClusterLink(sender->link);
             }
@@ -3691,14 +3750,7 @@ int clusterProcessPacket(clusterLink *link) {
          * config accordingly. */
         clusterUpdateSlotsConfigWith(n, reportedConfigEpoch, hdr->data.update.nodecfg.slots);
     } else if (type == CLUSTERMSG_TYPE_MODULE) {
-        if (!sender) return 1; /* Protect the module from unknown nodes. */
-        /* We need to route this message back to the right module subscribed
-         * for the right message type. */
-        uint64_t module_id = hdr->data.module.msg.module_id; /* Endian-safe ID */
-        uint32_t len = ntohl(hdr->data.module.msg.len);
-        uint8_t type = hdr->data.module.msg.type;
-        unsigned char *payload = hdr->data.module.msg.bulk_data;
-        moduleCallClusterReceivers(sender->name, module_id, type, payload, len);
+        clusterProcessModulePacket(&hdr->data.module.msg, sender);
     } else {
         serverLog(LL_WARNING, "Received unknown packet type: %d", type);
     }
@@ -4312,26 +4364,69 @@ void clusterSendUpdate(clusterLink *link, clusterNode *node) {
     clusterMsgSendBlockDecrRefCount(msgblock);
 }
 
+/* Create a MODULE message block.
+ *
+ * If is_light is 1, then build a message block with `clusterMsgLight` struct else `clusterMsg`. */
+static clusterMsgSendBlock *createModuleMsgBlock(int64_t module_id, uint8_t type, const char *payload, uint32_t len, int is_light) {
+    uint32_t msglen;
+    int msgtype;
+    clusterMsgSendBlock *msgblock;
+    clusterMsgModule *module_data;
+
+    if (is_light) {
+        msglen = sizeof(clusterMsgLight) - sizeof(union clusterMsgData);
+        msgtype = CLUSTERMSG_TYPE_MODULE | CLUSTERMSG_LIGHT;
+    } else {
+        msglen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
+        msgtype = CLUSTERMSG_TYPE_MODULE;
+    }
+    msglen += sizeof(clusterMsgModule) - 3 + len;
+    msgblock = createClusterMsgSendBlock(msgtype, msglen);
+
+    if (is_light) {
+        clusterMsgLight *hdr = getLightMessageFromSendBlock(msgblock);
+        module_data = &hdr->data.module.msg;
+    } else {
+        clusterMsg *hdr = getMessageFromSendBlock(msgblock);
+        module_data = &hdr->data.module.msg;
+    }
+
+    module_data->module_id = module_id; /* Already endian adjusted */
+    module_data->type = type;
+    module_data->len = htonl(len);
+    memcpy(module_data->bulk_data, payload, len);
+
+    return msgblock;
+}
+
 /* Send a MODULE message.
  *
  * If link is NULL, then the message is broadcasted to the whole cluster. */
 void clusterSendModule(clusterLink *link, uint64_t module_id, uint8_t type, const char *payload, uint32_t len) {
-    uint32_t msglen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
-    msglen += sizeof(clusterMsgModule) - 3 + len;
-    clusterMsgSendBlock *msgblock = createClusterMsgSendBlock(CLUSTERMSG_TYPE_MODULE, msglen);
+    clusterMsgSendBlock *msgblock[CLUSTERMSG_HDR_NUM] = {0};
+    ClusterNodeIterator iter;
 
-    clusterMsg *hdr = getMessageFromSendBlock(msgblock);
-    hdr->data.module.msg.module_id = module_id; /* Already endian adjusted. */
-    hdr->data.module.msg.type = type;
-    hdr->data.module.msg.len = htonl(len);
-    memcpy(hdr->data.module.msg.bulk_data, payload, len);
-
-    if (link)
-        clusterSendMessage(link, msgblock);
-    else
-        clusterBroadcastMessage(msgblock);
-
-    clusterMsgSendBlockDecrRefCount(msgblock);
+    if (link) {
+        clusterNodeIterNode(&iter, link->node);
+    } else {
+        /* Broadcast to all the nodes. */
+        clusterNodeIterInitAllNodes(&iter);
+    }
+    clusterNode *node;
+    while ((node = clusterNodeIterNext(&iter)) != NULL) {
+        if (node->flags & (CLUSTER_NODE_MYSELF | CLUSTER_NODE_HANDSHAKE)) continue;
+        int is_light = nodeSupportsLightMsgHdrForModule(node) ? CLUSTERMSG_HDR_LIGHT : CLUSTERMSG_HDR_NORMAL;
+        if (msgblock[is_light] == NULL) {
+            msgblock[is_light] = createModuleMsgBlock(module_id, type, payload, len, is_light);
+        }
+        clusterSendMessage(node->link, msgblock[is_light]);
+    }
+    clusterNodeIterReset(&iter);
+    for (int hdr_type = CLUSTERMSG_HDR_NORMAL; hdr_type < CLUSTERMSG_HDR_NUM; hdr_type++) {
+        if (msgblock[hdr_type]) {
+            clusterMsgSendBlockDecrRefCount(msgblock[hdr_type]);
+        }
+    }
 }
 
 /* This function gets a cluster node ID string as target, the same way the nodes
@@ -4381,7 +4476,7 @@ void clusterPropagatePublish(robj *channel, robj *message, int sharded) {
     clusterNode *node;
     while ((node = clusterNodeIterNext(&iter)) != NULL) {
         if (node->flags & (CLUSTER_NODE_MYSELF | CLUSTER_NODE_HANDSHAKE)) continue;
-        if (nodeSupportsLightMsgHdr(node)) {
+        if (nodeSupportsLightMsgHdrForPubSub(node)) {
             clusterSendMessage(node->link, msgblock_light);
         } else {
             if (msgblock == NULL) {
@@ -4691,6 +4786,10 @@ void clusterFailoverReplaceYourPrimary(void) {
 
     /* 5) If there was a manual failover in progress, clear the state. */
     resetManualFailover();
+
+    /* Since we have became a new primary node, we may rely on auth_time to
+     * determine whether a failover is in progress, so it is best to reset it. */
+    server.cluster->failover_auth_time = 0;
 }
 
 /* This function is called if we are a replica node and our primary serving
@@ -5934,8 +6033,8 @@ sds clusterGenNodeDescription(client *c, clusterNode *node, int tls_primary) {
     return ci;
 }
 
-/* Generate the slot topology for all nodes and store the string representation
- * in the slots_info struct on the node. This is used to improve the efficiency
+/* Generate the slot topology for all nodes and store the slot range information
+ * in the slot_info_pairs array on the node. This is used to improve the efficiency
  * of clusterGenNodesDescription() because it removes looping of the slot space
  * for generating the slot info for each node individually. */
 void clusterGenNodesSlotsInfo(int filter) {
@@ -6146,6 +6245,10 @@ void clusterUpdateSlots(client *c, unsigned char *slots, int del) {
     }
 }
 
+/* Get the replication offset of a node.
+ *
+ * Nodes do not update their own information in the cluster state,
+ * so for self node, we cannot use `node->repl_offset` directly. */
 long long getNodeReplicationOffset(clusterNode *node) {
     if (node->flags & CLUSTER_NODE_MYSELF) {
         return nodeIsReplica(node) ? replicationGetReplicaOffset() : server.primary_repl_offset;
@@ -6340,7 +6443,7 @@ unsigned int delKeysInSlot(unsigned int hashslot) {
 
     kvstoreHashtableIterator *kvs_di = NULL;
     void *next;
-    kvs_di = kvstoreGetHashtableSafeIterator(server.db->keys, hashslot);
+    kvs_di = kvstoreGetHashtableIterator(server.db->keys, hashslot, HASHTABLE_ITER_SAFE);
     while (kvstoreHashtableIteratorNext(kvs_di, &next)) {
         robj *valkey = next;
         enterExecutionUnit(1, 0);
@@ -7181,10 +7284,6 @@ clusterNode *getNodeBySlot(int slot) {
 
 char *clusterNodeHostname(clusterNode *node) {
     return node->hostname;
-}
-
-long long clusterNodeReplOffset(clusterNode *node) {
-    return node->repl_offset;
 }
 
 const char *clusterNodePreferredEndpoint(clusterNode *n, client *c) {
