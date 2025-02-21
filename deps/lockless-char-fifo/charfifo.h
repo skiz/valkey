@@ -11,8 +11,8 @@
 #include <stdlib.h>
 
 typedef struct {
-    size_t read_idx;
-    size_t write_idx;
+    _Atomic(size_t) read_idx;
+    _Atomic(size_t) write_idx;
     size_t size;
 } charfifo_header_t;
 

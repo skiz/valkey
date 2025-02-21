@@ -23,7 +23,7 @@
 #define EXTRACT_FIFO_BUF(p) \
     volatile char* fifo_buf = (char*)p + sizeof(charfifo_header_t);
 
-inline static size_t aget(size_t *p)
+inline static size_t aget(_Atomic(size_t) *p)
 {
     return atomic_load_explicit(p, memory_order_relaxed);
 }
@@ -82,7 +82,7 @@ static inline void MemcpyInDirection(char* fifo, char* buf, size_t bytes, transf
 }
 
 static inline void Transfer(volatile char *v_fifo_buf, char *buf, size_t bytes, 
-        volatile size_t *p_start_idx, size_t end_idx, size_t size, transfer_direction_t direction)
+        volatile _Atomic(size_t) *p_start_idx, size_t end_idx, size_t size, transfer_direction_t direction)
 {
     X("%lld Transfer(start_idx=%d end_idx=%d bytes=%d direction=%d\n", ustime(), *p_start_idx, end_idx, bytes, direction);
     size_t start_idx = atomic_load_explicit(p_start_idx, memory_order_acquire);

@@ -42,7 +42,7 @@ OPTIMIZATION?=-O3
 WARNINGS=-Wall -Wextra -Werror -Wstrict-prototypes -Wwrite-strings -Wno-missing-field-initializers
 DEBUG_FLAGS?= -g -ggdb
 REAL_CFLAGS=$(OPTIMIZATION) -fPIC $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(DEBUG_FLAGS) $(PLATFORM_FLAGS)
-REAL_LDFLAGS=$(LDFLAGS) -lrt
+REAL_LDFLAGS=$(LDFLAGS) #-lrt
 
 DYLIBSUFFIX=so
 STLIBSUFFIX=a
@@ -275,10 +275,10 @@ check: hiredis-test
 	$(CC) -std=c99 -c $(REAL_CFLAGS) $<
 
 shm.o:
-	$(CC) -std=c99 -pedantic -c $(REAL_CFLAGS) -D_XOPEN_SOURCE=500 $<
+	$(CC) -std=c11 -pedantic -c $(REAL_CFLAGS) -D_XOPEN_SOURCE=500 $<
 
 charfifo.o:
-	$(CC) -std=c99 -pedantic -c $(REAL_CFLAGS) $<
+	$(CC) -std=c11 -pedantic -c $(REAL_CFLAGS) $<
 
 clean:
 	rm -rf $(DYLIBNAME) $(STLIBNAME) $(SSL_DYLIBNAME) $(SSL_STLIBNAME) $(TESTS) $(PKGCONFNAME) examples/hiredis-example* *.o *.gcda *.gcno *.gcov
